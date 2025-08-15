@@ -1,5 +1,14 @@
+'''
+示例
+python /root/autodl-tmp/AAH/keypoints_detect.py \
+  --video /root/autodl-tmp/AAH/test/VAGotrdRsWk.mp4 \
+  --output /root/autodl-tmp/AAH/output \
+  --pose /path/to/pose.pt \
+  --detector /path/to/detector.pt \
+  --local-only
+'''
+
 import os
-import sys
 import argparse
 from pathlib import Path
 import glob
@@ -12,14 +21,16 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 def _save_results_to_csv_and_cleanup(results: dict, video_path: str, dest_folder: str) -> None:
     """将推理结果 DataFrame 保存为 CSV，并删除多余的可视化视频和中间文件。
 
-    Args:
-        results: video_inference_superanimal 返回的 {video_path: pd.DataFrame} 映射
-        video_path: 输入视频路径
-        dest_folder: 输出目录
+    /**
+     * @param {dict} results - `video_inference_superanimal` 返回的 {video_path: pd.DataFrame} 映射
+     * @param {str} video_path - 输入视频路径
+     * @param {str} dest_folder - 输出目录
+     * @returns {None}
+     */
     """
     for _vid, df in results.items():
         stem = Path(video_path).stem
-        csv_path = Path(dest_folder) / f"{stem}_predictions.csv"
+        csv_path = Path(dest_folder) / f"{stem}_keypoints_det.csv"
         df.to_csv(csv_path)
 
     stem = Path(video_path).stem
@@ -41,19 +52,23 @@ def _run_dlc30(
     dest_folder: str,
     pose_ckpt: str | None = None,
     detector_ckpt: str | None = None,
-) -> bool:
-    """尝试使用 DLC 3.0 的 SuperAnimal API 运行推理。返回是否成功。
+) -> None:
+    """使用 DLC 3.0 的 SuperAnimal API 运行推理。
 
-    Args:
-        video_path: 输入视频
-        dest_folder: 输出目录
-        pose_ckpt: 可选，自定义姿态模型 checkpoint 路径（.pt）
-        detector_ckpt: 可选，自定义检测器 checkpoint 路径（.pt）
+    /**
+     * @param {str} video_path - 输入视频
+     * @param {str} dest_folder - 输出目录
+     * @param {str | None} pose_ckpt - 可选，自定义姿态模型 checkpoint 路径（.pt）
+     * @param {str | None} detector_ckpt - 可选，自定义检测器 checkpoint 路径（.pt）
+     * @returns {None}
+     */
     """
     try:
         from deeplabcut.modelzoo.video_inference import video_inference_superanimal
-    except Exception:
-        return False
+    except Exception as exc:
+        raise SystemExit(
+            "未检测到可用的 DeepLabCut 3.0（或导入失败）。请安装兼容版本的 DLC 3.x。原始错误：" + str(exc)
+        )
 
     os.makedirs(dest_folder, exist_ok=True)
     results = video_inference_superanimal(
@@ -70,41 +85,12 @@ def _run_dlc30(
         customized_detector_checkpoint=detector_ckpt,
     )
     _save_results_to_csv_and_cleanup(results, video_path, dest_folder)
-    return True
-
-
-def _run_dlc23(config_path: str, video_path: str, dest_folder: str) -> None:
-    """使用 DLC 2.3 的 analyze_videos，仅输出 CSV。"""
-    import deeplabcut
-
-    os.makedirs(dest_folder, exist_ok=True)
-    deeplabcut.analyze_videos(
-        config_path,
-        [video_path],
-        videotype="mp4",
-        destfolder=dest_folder,
-        save_as_csv=True,
-        save_as_h5=True,
-    )
-    # DLC2.3 会同时生成 h5；此处仅保留 CSV
-    stem = Path(video_path).stem
-    for fpath in glob.glob(str(Path(dest_folder) / f"{stem}_*.h5")):
-        try:
-            os.remove(fpath)
-        except OSError:
-            pass
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DeepLabCut 无 GUI 关键点导出 CSV")
+    parser = argparse.ArgumentParser(description="DeepLabCut 3.0 无 GUI 关键点导出 CSV")
     parser.add_argument("--video", type=str, default="test/VAGotrdRsWk.mp4", help="输入视频路径")
     parser.add_argument("--output", type=str, default="output", help="输出目录")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="DLC 2.3 模式所需的项目 config.yaml 路径；当 3.0 API 不可用时必填",
-    )
     parser.add_argument("--pose", type=str, default=None, help="DLC3.0：本地姿态模型 checkpoint (.pt) 路径")
     parser.add_argument("--detector", type=str, default=None, help="DLC3.0：本地检测器 checkpoint (.pt) 路径")
     parser.add_argument("--hf-endpoint", type=str, default=None, help="HuggingFace 镜像，例如 https://hf-mirror.com")
@@ -121,19 +107,8 @@ def main() -> None:
     if args.local_only:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
-    # 先尝试 DLC 3.0 模式（可传入本地权重以避免下载）
-    ran = _run_dlc30(video_path, dest_folder, args.pose, args.detector)
-    if ran:
-        return
-
-    # 回退到 DLC 2.3 模式
-    if not args.config:
-        print(
-            "未检测到 DLC 3.0 API，且未提供 --config。请提供 DLC 2.3 项目的 config.yaml 路径以继续。",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    _run_dlc23(args.config, video_path, dest_folder)
+    # 运行 DLC 3.0 推理（可传入本地权重以避免下载）
+    _run_dlc30(video_path, dest_folder, args.pose, args.detector)
 
 
 if __name__ == "__main__":
