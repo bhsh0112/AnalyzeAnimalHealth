@@ -1,0 +1,50 @@
+Task: HorseHoof
+scorer: user
+date: "2025-08-15"
+
+# 项目根目录（请修改为你的实际目录）
+project_path: /root/autodl-tmp/AAH/dlc_horse_hoof
+
+# 单视频输入（请将路径替换为你的实际视频绝对路径）
+video_sets:
+  /absolute/path/to/your/video.mp4:
+    crop: null
+
+# 关键点定义（示例：四个马蹄关键点）
+bodyparts:
+  - front_left_hoof
+  - front_right_hoof
+  - hind_left_hoof
+  - hind_right_hoof
+
+# 骨架连接（用于叠加可视化）
+skeleton:
+  - - front_left_hoof
+    - front_right_hoof
+  - - hind_left_hoof
+    - hind_right_hoof
+
+# 训练/推理相关（需在项目下具备已训练快照才能推理）
+TrainingFraction:
+  - 0.95
+iteration: 0
+snapshotindex: -1  # -1 使用最新快照
+
+# 基础模型与增强
+default_net_type: resnet_50
+default_augmenter: default
+multianimalproject: false
+
+# 可视化参数
+dotsize: 6
+pcutoff: 0.1
+alphavalue: 0.7
+line_thickness: 2
+colormap: jet
+skeleton_color: black
+
+# 帧提取/裁剪（若仅推理可忽略）
+numframes2pick: 20
+cropping: false
+start: 0
+stop: 1
