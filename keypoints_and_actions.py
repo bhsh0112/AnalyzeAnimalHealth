@@ -1,5 +1,5 @@
 '''
-集成关键点检测和动作判断的完整解决方案
+集成关键点检测和姿态判断的完整解决方案
 
 示例使用：
 python /root/autodl-tmp/AAH/keypoints_and_actions.py \
@@ -10,9 +10,9 @@ python /root/autodl-tmp/AAH/keypoints_and_actions.py \
 
 功能特性：
 1. 逐帧关键点检测（基于 DLC 3.0）
-2. 实时动作分类（stand/walk/run）
-3. 增强可视化（在关键点基础上叠加动作标签）
-4. 输出关键点CSV和动作CSV
+2. 实时姿态分类（upright / upright_head_down / lying）
+3. 增强可视化（在关键点基础上叠加姿态标签）
+4. 输出关键点CSV和姿态CSV
 '''
 
 import os
@@ -50,29 +50,36 @@ class ActionResult:
 
 
 class RealTimeActionClassifier:
-    """实时动作分类器，处理逐帧关键点数据"""
-    
-    def __init__(self, 
-                 min_likelihood: float = 0.5,
-                 smoothing_window: int = 5,
-                 move_threshold_frac: float = 0.02,
-                 run_threshold_frac: float = 0.08):
+    """实时姿态分类器，处理逐帧关键点数据"""
+
+    def __init__(
+        self,
+        min_likelihood: float = 0.5,
+        smoothing_window: int = 5,
+        torso_upright_angle_deg: float = 40.0,
+        torso_lying_angle_deg: float = 65.0,
+        head_down_drop_frac: float = 0.15,
+        lying_gap_frac: float = 0.25,
+    ):
         """
-        初始化实时动作分类器
-        
+        初始化实时姿态分类器
+
         /**
          * @param {number} min_likelihood - 最小置信度阈值
-         * @param {number} smoothing_window - 速度平滑窗口大小
-         * @param {number} move_threshold_frac - 站立/行走阈值（相对于体长）
-         * @param {number} run_threshold_frac - 行走/奔跑阈值（相对于体长）
+         * @param {number} smoothing_window - 历史中心平滑窗口，用于稳定可视化位置
+         * @param {number} torso_upright_angle_deg - 躯干相对垂直方向的角度阈值（小于该值视为直立）
+         * @param {number} torso_lying_angle_deg - 躯干相对垂直方向的角度阈值（大于该值视为卧倒）
+         * @param {number} head_down_drop_frac - 头部相对颈部的下探距离阈值（相对于体长，超过视为低头）
          */
         """
         self.min_likelihood = min_likelihood
         self.smoothing_window = smoothing_window
-        self.move_threshold_frac = move_threshold_frac
-        self.run_threshold_frac = run_threshold_frac
-        
-        # 存储历史数据用于滑动平均
+        self.torso_upright_angle_deg = torso_upright_angle_deg
+        self.torso_lying_angle_deg = torso_lying_angle_deg
+        self.head_down_drop_frac = head_down_drop_frac
+        self.lying_gap_frac = lying_gap_frac
+
+        # 存储历史数据（位置平滑用）
         self.history: Dict[str, Dict[str, List[float]]] = {}
         self.body_lengths: Dict[str, float] = {}
     
@@ -171,6 +178,113 @@ class RealTimeActionClassifier:
             return self.body_lengths[individual]
         
         return 100.0  # 默认值
+
+    def _estimate_head_point(self, frame_data: pd.Series, individual: str) -> Optional[Tuple[float, float]]:
+        """估计头部关键点位置（若存在）。
+
+        /**
+         * @param {pd.Series} frame_data - 单帧关键点数据
+         * @param {string} individual - 个体ID
+         * @returns {[number, number] | None} [x, y] 或 None
+         */
+        """
+        head_candidates = [
+            "nose",
+            "snout",
+            "head",
+            "head_top",
+            "head_front",
+            "mouth",
+        ]
+        for part in head_candidates:
+            pt = self._extract_keypoint(frame_data, individual, part)
+            if pt:
+                return pt[0], pt[1]
+        return None
+
+    def _max_valid_y(self, frame_data: pd.Series, individual: str) -> Optional[float]:
+        """获取该个体所有可用关键点中最大的 y（图像坐标向下为正）。
+
+        /**
+         * @param {pd.Series} frame_data - 单帧关键点数据
+         * @param {string} individual - 个体ID
+         * @returns {number | None} 最大 y 值
+         */
+        """
+        max_y = None
+        try:
+            # MultiIndex: (scorer, individual, bodypart, coord)
+            for col in frame_data.index:
+                if len(col) < 4:
+                    continue
+                if col[1] != individual:
+                    continue
+                if col[3] != 'y':
+                    continue
+                # 找对应的 likelihood 列
+                l_col = (col[0], col[1], col[2], 'likelihood')
+                likelihood = frame_data.get(l_col, 1.0)
+                if self._safe_float(likelihood) < self.min_likelihood:
+                    continue
+                y_val = self._safe_float(frame_data[col])
+                if not math.isfinite(y_val):
+                    continue
+                if max_y is None or y_val > max_y:
+                    max_y = y_val
+        except Exception:
+            return None
+        return max_y
+
+    def _compute_torso_angle_to_vertical_deg(
+        self, frame_data: pd.Series, individual: str
+    ) -> Optional[float]:
+        """计算躯干轴线相对垂直方向的夹角（度）。0 表示完全垂直，90 表示完全水平。
+
+        /**
+         * @param {pd.Series} frame_data - 单帧关键点数据
+         * @param {string} individual - 个体ID
+         * @returns {number | None} 角度（度）
+         */
+        """
+        # 使用 neck_base ←→ tail_base 或 back_base ←→ back_end 作为躯干轴
+        a = self._extract_keypoint(frame_data, individual, "neck_base")
+        b = self._extract_keypoint(frame_data, individual, "tail_base")
+        if not (a and b):
+            a = self._extract_keypoint(frame_data, individual, "back_base")
+            b = self._extract_keypoint(frame_data, individual, "back_end")
+        if not (a and b):
+            return None
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        angle_h = math.degrees(math.atan2(abs(dy), abs(dx) + 1e-9))  # 与水平的角度（0~90）
+        angle_to_vertical = abs(90.0 - angle_h)
+        return angle_to_vertical
+
+    def _is_head_down(
+        self, frame_data: pd.Series, individual: str, body_length: float
+    ) -> Optional[bool]:
+        """判断是否低头。首选 head 相对 neck 的下探；若无 head，则用 neck 相对 back_middle 的下探近似。
+
+        /**
+         * @param {pd.Series} frame_data - 单帧关键点数据
+         * @param {string} individual - 个体ID
+         * @param {number} body_length - 身体长度（像素）
+         * @returns {boolean | None} 是否低头；无法判断返回 None
+         */
+        """
+        neck = self._extract_keypoint(frame_data, individual, "neck_base")
+        if neck is None:
+            return None
+        head = self._estimate_head_point(frame_data, individual)
+        if head is not None:
+            drop = head[1] - neck[1]  # y 向下为正
+            return drop > self.head_down_drop_frac * max(body_length, 1e-6)
+        # 回退：使用 back_middle 作为参考（neck 明显低于背部中心视为低头）
+        back_mid = self._extract_keypoint(frame_data, individual, "back_middle")
+        if back_mid:
+            drop = neck[1] - back_mid[1]
+            return drop > self.head_down_drop_frac * max(body_length, 1e-6)
+        return None
     
     def _rolling_mean(self, values: List[float], window: int) -> float:
         """计算滑动平均"""
@@ -216,15 +330,9 @@ class RealTimeActionClassifier:
                 # 更新身体长度的滑动平均
                 self.body_lengths[individual] = 0.9 * self.body_lengths[individual] + 0.1 * body_length
             
-            # 计算速度
+            # 速度对姿态分类非必需，仅用于保持与现有输出字段兼容
             speed_px = 0.0
-            if self.history[individual]['center_x']:
-                prev_x = self.history[individual]['center_x'][-1]
-                prev_y = self.history[individual]['center_y'][-1]
-                dx = center[0] - prev_x
-                dy = center[1] - prev_y
-                speed_px = math.sqrt(dx*dx + dy*dy)
-            
+
             # 更新历史数据
             self.history[individual]['center_x'].append(center[0])
             self.history[individual]['center_y'].append(center[1])
@@ -236,24 +344,33 @@ class RealTimeActionClassifier:
                 if len(self.history[individual][key]) > max_history:
                     self.history[individual][key] = self.history[individual][key][-max_history:]
             
-            # 计算平滑速度
+            # 计算平滑速度（保持字段填充，不参与分类）
             smooth_speed = self._rolling_mean(self.history[individual]['speed'], self.smoothing_window)
-            
-            # 归一化速度
             speed_norm = smooth_speed / self.body_lengths[individual] if self.body_lengths[individual] > 1e-6 else 0.0
-            
-            # 动作分类
-            if speed_norm < self.move_threshold_frac:
-                action = "stand"
-            elif speed_norm < self.run_threshold_frac:
-                action = "walk"
+
+            # 姿态分类：优先使用“垂直间隙”规则区分 lying/upright，其次再判定低头
+            posture = "upright"
+            max_y = self._max_valid_y(frame_data, individual)
+            if max_y is not None and math.isfinite(center[1]) and self.body_lengths[individual] > 1e-6:
+                vertical_gap = max_y - center[1]
+                if vertical_gap <= self.lying_gap_frac * self.body_lengths[individual]:
+                    posture = "lying"
+                else:
+                    head_down = self._is_head_down(frame_data, individual, self.body_lengths[individual])
+                    posture = "upright_head_down" if head_down else "upright"
             else:
-                action = "run"
+                # 回退：使用躯干角度作为辅助（不激进判 lying）
+                torso_angle_to_vertical = self._compute_torso_angle_to_vertical_deg(frame_data, individual)
+                if torso_angle_to_vertical is not None and torso_angle_to_vertical >= self.torso_lying_angle_deg:
+                    posture = "lying"
+                else:
+                    head_down = self._is_head_down(frame_data, individual, self.body_lengths[individual])
+                    posture = "upright_head_down" if head_down else "upright"
             
             results.append(ActionResult(
                 frame=frame_num,
                 animal=individual,
-                action=action,
+                action=posture,
                 speed_px=smooth_speed,
                 body_length_px=self.body_lengths[individual],
                 speed_norm_body=speed_norm,
@@ -344,9 +461,9 @@ def _enhance_visualization_with_actions(video_path: str, dest_folder: str, actio
     
     frame_idx = 0
     action_colors = {
-        'stand': (0, 255, 0),    # 绿色
-        'walk': (255, 255, 0),   # 黄色
-        'run': (0, 0, 255)       # 红色
+        'upright': (0, 255, 0),            # 绿色
+        'upright_head_down': (255, 255, 0),# 黄色
+        'lying': (0, 0, 255)               # 红色
     }
     
     try:
@@ -458,13 +575,13 @@ def _run_dlc30_with_actions(
                 fps = cap.get(cv2.CAP_PROP_FPS) or None
                 cap.release()
         
-        # 创建动作结果 DataFrame
+        # 创建姿态结果 DataFrame
         action_data = []
         for result in all_action_results:
             row = {
                 'frame': result.frame,
                 'animal': result.animal,
-                'action': result.action,
+                'posture': result.action,
                 'speed_px': result.speed_px,
                 'body_length_px': result.body_length_px,
                 'speed_norm_body': result.speed_norm_body
@@ -477,15 +594,15 @@ def _run_dlc30_with_actions(
         
         # 调整列顺序
         if fps and fps > 0:
-            action_df = action_df[['frame', 'time_s', 'animal', 'action', 'speed_px', 'body_length_px', 'speed_norm_body']]
+            action_df = action_df[['frame', 'time_s', 'animal', 'posture', 'speed_px', 'body_length_px', 'speed_norm_body']]
         else:
-            action_df = action_df[['frame', 'animal', 'action', 'speed_px', 'body_length_px', 'speed_norm_body']]
+            action_df = action_df[['frame', 'animal', 'posture', 'speed_px', 'body_length_px', 'speed_norm_body']]
         
-        # 保存动作分析结果
+        # 保存姿态分析结果
         stem = Path(video_path).stem
-        action_csv_path = Path(dest_folder) / f"{stem}_actions.csv"
+        action_csv_path = Path(dest_folder) / f"{stem}_postures.csv"
         action_df.to_csv(action_csv_path, index=False)
-        print(f"动作分析结果已保存到：{action_csv_path}")
+        print(f"姿态分析结果已保存到：{action_csv_path}")
         
         # 如果保存可视化，则增强可视化结果
         if save_vis:
@@ -537,7 +654,7 @@ def _images_to_video(image_paths: list[str], dest_folder: str, fps: float = 20) 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="集成关键点检测和动作分类的完整解决方案")
+    parser = argparse.ArgumentParser(description="集成关键点检测和姿态分类的完整解决方案")
     parser.add_argument(
         "--video",
         type=str,
@@ -549,13 +666,15 @@ def main() -> None:
     parser.add_argument("--detector", type=str, default=None, help="DLC3.0：本地检测器 checkpoint (.pt) 路径")
     parser.add_argument("--hf-endpoint", type=str, default=None, help="HuggingFace 镜像，例如 https://hf-mirror.com")
     parser.add_argument("--local-only", action="store_true", help="仅离线：禁止联网下载，必须配合 --pose/--detector")
-    parser.add_argument("--save-vis", action="store_true", help="保存关键点检测的可视化视频（含动作标签）")
+    parser.add_argument("--save-vis", action="store_true", help="保存关键点检测的可视化视频（含姿态标签）")
     
-    # 动作分类参数
+    # 姿态分类参数
     parser.add_argument("--min-likelihood", type=float, default=0.5, help="最小置信度阈值")
-    parser.add_argument("--smooth-win", type=int, default=5, help="速度平滑窗口（帧）")
-    parser.add_argument("--move-thr", type=float, default=0.02, help="站立/行走阈值（体长/帧）")
-    parser.add_argument("--run-thr", type=float, default=0.08, help="行走/奔跑阈值（体长/帧）")
+    parser.add_argument("--smooth-win", type=int, default=5, help="位置平滑窗口（帧）")
+    parser.add_argument("--torso-upright-deg", type=float, default=40.0, help="upright 阈值：躯干相对垂直角度 ≤ 此值判为 upright/upright_head_down")
+    parser.add_argument("--torso-lying-deg", type=float, default=65.0, help="lying 阈值：躯干相对垂直角度 ≥ 此值判为 lying")
+    parser.add_argument("--head-down-frac", type=float, default=0.15, help="upright_head_down 阈值：头部相对颈部下探距离阈值（体长比例）")
+    parser.add_argument("--lying-gap-frac", type=float, default=0.25, help="lying 判定阈值：躯干中心到所有关键点最大 y 的垂直间隙占体长比例上限")
     
     args = parser.parse_args()
 
@@ -569,12 +688,14 @@ def main() -> None:
     if args.local_only:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
-    # 动作分类参数
+    # 姿态分类参数
     action_params = {
         'min_likelihood': args.min_likelihood,
         'smoothing_window': args.smooth_win,
-        'move_threshold_frac': args.move_thr,
-        'run_threshold_frac': args.run_thr,
+        'torso_upright_angle_deg': args.torso_upright_deg,
+        'torso_lying_angle_deg': args.torso_lying_deg,
+        'head_down_drop_frac': args.head_down_frac,
+        'lying_gap_frac': args.lying_gap_frac,
     }
 
     # 判断输入类型：文件夹/视频（不支持单张图片）
