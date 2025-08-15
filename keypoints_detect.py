@@ -10,8 +10,7 @@ import os
 import argparse
 from pathlib import Path
 import glob
-import uuid
-from typing import List
+ 
 
 try:
     import cv2  # 用于将多张图片拼接为视频（回退路径）
@@ -53,44 +52,6 @@ def _save_results_to_csv_and_cleanup(results: dict, video_path: str, dest_folder
                 os.remove(fpath)
             except OSError:
                 pass
-
-
-def _save_image_results_to_csv(results: dict, dest_folder: str) -> None:
-    """将图片推理结果分别保存为 CSV（每张图片一个 CSV）。
-
-    /**
-     * @param {dict} results - `image_inference_superanimal` 返回的 {image_path: pd.DataFrame} 映射
-     * @param {str} dest_folder - 输出目录
-     * @returns {None}
-     */
-    """
-    for img_path, df in results.items():
-        stem = Path(img_path).stem
-        csv_path = Path(dest_folder) / f"{stem}_keypoints_det.csv"
-        df.to_csv(csv_path)
-
-
-def _write_per_frame_csv(df, image_paths: List[str], dest_folder: str) -> None:
-    """将视频推理返回的单个 DataFrame 按帧拆分，逐张图片输出 CSV。
-
-    /**
-     * @param {pd.DataFrame} df - DLC 视频推理的 DataFrame（多帧）
-     * @param {Array<string>} image_paths - 与帧顺序一致的图片路径数组
-     * @param {str} dest_folder - 输出目录
-     * @returns {None}
-     */
-    """
-    num_frames = len(df)
-    if num_frames != len(image_paths):
-        # 若帧数与图片数不匹配，尽量按最小长度输出，避免崩溃
-        limit = min(num_frames, len(image_paths))
-    else:
-        limit = num_frames
-    for i in range(limit):
-        img_path = image_paths[i]
-        stem = Path(img_path).stem
-        csv_path = Path(dest_folder) / f"{stem}_keypoints_det.csv"
-        df.iloc[i : i + 1].to_csv(csv_path)
 
 
 def _run_dlc30(
@@ -135,68 +96,34 @@ def _run_dlc30(
     _save_results_to_csv_and_cleanup(results, video_path, dest_folder, save_vis)
 
 
-def _run_dlc30_images(
-    image_paths: list[str],
-    dest_folder: str,
-    pose_ckpt: str | None = None,
-    detector_ckpt: str | None = None,
-    save_vis: bool = False,
-) -> None:
-    """使用 DLC 3.0 的 SuperAnimal API 对多张图片运行推理。
+def _images_to_video(image_paths: list[str], dest_folder: str, fps: float = 1.0) -> str:
+    """将图片序列按首图分辨率拼接成临时视频并返回视频路径。
 
     /**
-     * @param {Array<string>} image_paths - 图片路径列表
-     * @param {str} dest_folder - 输出目录
-     * @param {str | None} pose_ckpt - 可选，自定义姿态模型 checkpoint 路径（.pt）
-     * @param {str | None} detector_ckpt - 可选，自定义检测器 checkpoint 路径（.pt）
-     * @param {bool} save_vis - 是否保存可视化视频（若图片 API 不支持，将回退到视频路径以生成可视化）
-     * @returns {None}
+     * @param {Array<string>} image_paths - 需要按顺序写入的视频帧图片路径
+     * @param {str} dest_folder - 输出目录（临时视频将写入此目录）
+     * @param {number} fps - 临时视频帧率
+     * @returns {str} 临时视频文件的绝对路径
      */
     """
-    # 优先尝试图片推理 API；若不存在则回退为“拼接临时视频再视频推理”。
-    try:
-        from deeplabcut.modelzoo.image_inference import image_inference_superanimal
-    except Exception:
-        image_inference_superanimal = None
+    if cv2 is None:
+        raise SystemExit(
+            "OpenCV 未安装，无法将图片拼接为视频。请先安装 opencv-python。"
+        )
 
     os.makedirs(dest_folder, exist_ok=True)
 
-    # 若需要保存可视化视频，则直接使用回退的视频路径，确保能生成 labeled 视频
-    if image_inference_superanimal is not None and not save_vis:
-        results = image_inference_superanimal(
-            images=image_paths,
-            superanimal_name="superanimal_quadruped",
-            model_name="hrnet_w32",
-            detector_name="fasterrcnn_resnet50_fpn_v2",
-            dest_folder=dest_folder,
-            plot_bboxes=False,
-            batch_size=1,
-            detector_batch_size=1,
-            pcutoff=0.1,
-            customized_pose_checkpoint=pose_ckpt,
-            customized_detector_checkpoint=detector_ckpt,
-        )
-        _save_image_results_to_csv(results, dest_folder)
-        return
-
-    # 回退实现：将图片序列写入临时视频，再用视频推理；随后按帧拆分结果到逐图 CSV
-    if cv2 is None:
-        raise SystemExit(
-            "OpenCV 未安装，且 DLC3.0 图片推理 API 不可用。请安装 opencv-python 或升级 DLC3.0 以支持图片推理。"
-        )
-
-    # 读取首图，确定视频分辨率
     first_img = cv2.imread(image_paths[0])
     if first_img is None:
         raise SystemExit(f"无法读取图片：{image_paths[0]}")
     height, width = first_img.shape[:2]
 
-    tmp_stem = f"_dlcimg_{uuid.uuid4().hex[:8]}"
-    tmp_video = str(Path(dest_folder) / f"{tmp_stem}.mp4")
+    # 使用所在目录名作为视频文件名，使后续输出与视频处理命名规则保持一致
+    folder_name = Path(image_paths[0]).parent.name
+    tmp_video = str(Path(dest_folder) / f"{folder_name}.mp4")
 
-    # 写入视频（保持所有图片 resize 到首图大小）
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(tmp_video, fourcc, 1.0, (width, height))
+    writer = cv2.VideoWriter(tmp_video, fourcc, float(fps), (width, height))
     if not writer.isOpened():
         raise SystemExit("无法创建临时视频文件，请检查 OpenCV 的编解码器支持。")
     try:
@@ -210,64 +137,8 @@ def _run_dlc30_images(
     finally:
         writer.release()
 
-    # 调用视频推理，获取 DataFrame 并按帧输出 CSV
-    try:
-        from deeplabcut.modelzoo.video_inference import video_inference_superanimal
-    except Exception as exc:
-        raise SystemExit(
-            "未检测到可用的 DeepLabCut 3.0 视频推理 API。原始错误：" + str(exc)
-        )
+    return tmp_video
 
-    results = video_inference_superanimal(
-        videos=[tmp_video],
-        superanimal_name="superanimal_quadruped",
-        model_name="hrnet_w32",
-        detector_name="fasterrcnn_resnet50_fpn_v2",
-        dest_folder=dest_folder,
-        plot_bboxes=False,
-        batch_size=1,
-        detector_batch_size=1,
-        pcutoff=0.1,
-        customized_pose_checkpoint=pose_ckpt,
-        customized_detector_checkpoint=detector_ckpt,
-    )
-
-    # results: {video_path: df}
-    df = results.get(tmp_video)
-    if df is None:
-        raise SystemExit("视频推理未返回结果。")
-    _write_per_frame_csv(df, image_paths, dest_folder)
-
-    # 清理 DLC 产生的中间文件和临时视频；可选保留可视化视频
-    stem = Path(tmp_video).stem
-    patterns = [
-        f"{stem}_*.h5",
-        f"{stem}_*.json",
-        f"{stem}_*.csv",
-    ]
-    # 若不保存可视化视频，则一并删除 labeled 视频
-    if not save_vis:
-        patterns.insert(0, f"{stem}_*_labeled*.mp4")
-    for pat in patterns:
-        for fpath in glob.glob(str(Path(dest_folder) / pat)):
-            try:
-                os.remove(fpath)
-            except OSError:
-                pass
-    # 如果需要保留可视化视频，尝试将临时命名的 labeled 视频重命名为更友好的输出名
-    if save_vis:
-        labeled_candidates = list(Path(dest_folder).glob(f"{stem}_*_labeled*.mp4"))
-        if labeled_candidates:
-            target_name = f"{Path(image_paths[0]).parent.name}_labeled.mp4"
-            try:
-                labeled_candidates[0].rename(Path(dest_folder) / target_name)
-            except OSError:
-                pass
-    # 删除临时视频
-    try:
-        os.remove(tmp_video)
-    except OSError:
-        pass
 
 
 def main() -> None:
@@ -276,7 +147,7 @@ def main() -> None:
         "--video",
         type=str,
         default="test/VAGotrdRsWk.mp4",
-        help="输入路径：视频文件、单张图片或包含图片的文件夹",
+        help="输入路径：视频文件或包含图片的文件夹（不支持单张图片）",
     )
     parser.add_argument("--output", type=str, default="output", help="输出目录")
     parser.add_argument("--pose", type=str, default=None, help="DLC3.0：本地姿态模型 checkpoint (.pt) 路径")
@@ -296,7 +167,7 @@ def main() -> None:
     if args.local_only:
         os.environ["HF_HUB_OFFLINE"] = "1"
 
-    # 判断输入类型：文件夹/单张图片/视频
+    # 判断输入类型：文件夹/视频（不支持单张图片）
     input_path = Path(video_path)
     if input_path.is_dir():
         # 收集文件夹下的图片文件（非递归，可按需改为递归）
@@ -306,14 +177,24 @@ def main() -> None:
             image_paths.extend([str(p) for p in input_path.glob(ext)])
         if not image_paths:
             raise SystemExit(f"在目录中未找到图片文件：{input_path}")
-        _run_dlc30_images(image_paths, dest_folder, args.pose, args.detector, args.save_vis)
+        # 排序以保证帧顺序可复现
+        image_paths = sorted(image_paths)
+        # 先拼接为视频，再按视频路径执行与视频一致的流程与输出
+        tmp_video = _images_to_video(image_paths, dest_folder, fps=1.0)
+        try:
+            _run_dlc30(tmp_video, dest_folder, args.pose, args.detector, args.save_vis)
+        finally:
+            try:
+                os.remove(tmp_video)
+            except OSError:
+                pass
         return
 
     # 文件：根据扩展名区分图片或视频
     lower_name = input_path.name.lower()
     image_exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
     if lower_name.endswith(image_exts):
-        _run_dlc30_images([str(input_path)], dest_folder, args.pose, args.detector, args.save_vis)
+        raise SystemExit("当前不支持单张图片输入。请将图片放入文件夹后作为目录输入。")
     else:
         # 默认按视频处理
         _run_dlc30(str(input_path), dest_folder, args.pose, args.detector, args.save_vis)
